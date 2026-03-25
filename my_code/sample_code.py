@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-# Sample Code for Robotics_Assignment_3
-# Modified to satisfy milestone 3 requirements
-
 import sys
 import tty
 import termios
@@ -20,15 +17,18 @@ from sensor_msgs.msg import JointState
 
 
 linVelStepSize = 0.01
-angVelStepSize = 0.1
+angVelStepSize = 0.10
+
+maxLinearVel = 0.20
+minLinearVel = -0.20
+maxAngularVel = 1.50
+minAngularVel = -1.50
 
 gripperKeyBindings = {
-    'g': 0.01,   # open
-    'h': -0.01   # close
+    'g': 0.01,
+    'h': -0.01
 }
 
-# These are example presets.
-# You should test and adjust them on your robot if needed.
 poses = {
     '9': [0.0, 0.0, 0.0, 0.0],         # Home pose
     '0': [0.0, -1.10, 0.75, 0.35],     # Extend Forward
@@ -47,6 +47,10 @@ def getKey(settings):
 
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
     return key
+
+
+def clamp(value, low, high):
+    return max(low, min(value, high))
 
 
 class SimpleDemoController(Node):
@@ -110,8 +114,6 @@ class SimpleDemoController(Node):
             idx = msg.name.index('joint4')
             self.currentJ4 = msg.position[idx]
 
-        # Some setups expose the gripper joint name differently.
-        # Try a few common possibilities.
         possibleGripperNames = [
             'gripper',
             'gripper_left_joint',
@@ -133,16 +135,32 @@ class SimpleDemoController(Node):
             return
 
         if key == 'w':
-            self.targetLinearVel += linVelStepSize
+            self.targetLinearVel = clamp(
+                self.targetLinearVel + linVelStepSize,
+                minLinearVel,
+                maxLinearVel
+            )
 
         elif key == 'x':
-            self.targetLinearVel -= linVelStepSize
+            self.targetLinearVel = clamp(
+                self.targetLinearVel - linVelStepSize,
+                minLinearVel,
+                maxLinearVel
+            )
 
         elif key == 'a':
-            self.targetAngularVel += angVelStepSize
+            self.targetAngularVel = clamp(
+                self.targetAngularVel + angVelStepSize,
+                minAngularVel,
+                maxAngularVel
+            )
 
         elif key == 'd':
-            self.targetAngularVel -= angVelStepSize
+            self.targetAngularVel = clamp(
+                self.targetAngularVel - angVelStepSize,
+                minAngularVel,
+                maxAngularVel
+            )
 
         elif key == 's':
             self.targetLinearVel = 0.0
@@ -163,12 +181,14 @@ class SimpleDemoController(Node):
             sys.stdout.write('\nExiting...\n')
             sys.exit(0)
 
+        self.publishBaseCommand()
+        self.printStatus()
+
+    def publishBaseCommand(self):
         twist = Twist()
         twist.linear.x = self.targetLinearVel
         twist.angular.z = self.targetAngularVel
         self.cmdVelPub.publish(twist)
-
-        self.printStatus()
 
     def stopRobot(self):
         twist = Twist()
@@ -205,7 +225,7 @@ class SimpleDemoController(Node):
         self.gripperActionClient.send_goal_async(goal)
 
     def printStatus(self):
-        sys.stdout.write('\r' + ' ' * 140 + '\r')
+        sys.stdout.write('\r' + ' ' * 160 + '\r')
 
         statusString = (
             f"Present Linear Velocity: {self.targetLinearVel:.3f}, "
