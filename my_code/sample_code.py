@@ -1,33 +1,7 @@
 #!/usr/bin/env python3
 
 # ============================================================
-# robotics assignment 3
-#
-# this script creates a ros2 teleoperation interface for the
-# turtlebot3 + openmanipulatorx platform.
-#
-# features:
-# 1. keyboard-based mobile base control
-# 2. keyboard-based gripper open / close
-# 3. keyboard-based preset arm positions
-# 4. live terminal display for:
-#    - linear velocity
-#    - angular velocity
-#    - arm joint angles
-#    - gripper state
-#
-# intended keys:
-# w : increase forward velocity
-# x : decrease forward velocity / go backward
-# a : increase angular velocity left
-# d : decrease angular velocity / turn right
-# s : stop base
-# g : open gripper
-# h : close gripper
-# 0 : extend forward pose
-# 9 : home pose
-# 8 : wave pose
-# q : quit program
+# robotics assignment 3 - Teleop Node
 # ============================================================
 
 import sys
@@ -47,21 +21,12 @@ from sensor_msgs.msg import JointState
 
 
 # ============================================================
-# base velocity tuning values
-#
-# UPDATED: increased to overcome motor deadband/static friction
-# ============================================================
-linVelStepSize = 0.05
-angVelStepSize = 0.20
-
-
-# ============================================================
 # safety limits for the mobile base
 # ============================================================
 maxLinearVel = 0.20
-minLinearVel = -0.20
+minLinearVel = 0.0
 maxAngularVel = 1.50
-minAngularVel = -1.50
+minAngularVel = 0.0
 
 
 # ============================================================
@@ -107,17 +72,18 @@ def clamp(value, low, high):
 
 
 class SimpleDemoController(Node):
-    """
-    main ros2 node for the assignment.
-    """
-
     def __init__(self):
         super().__init__('simple_demo_controller')
 
         self.armJointNames = ['joint1', 'joint2', 'joint3', 'joint4']
 
+        # Command velocities sent to the robot
         self.targetLinearVel = 0.0
         self.targetAngularVel = 0.0
+
+        # Speed settings modified by v, b, n, m
+        self.control_lin_vel = 0.05
+        self.control_ang_vel = 0.20
 
         self.currentJ1 = 0.0
         self.currentJ2 = 0.0
@@ -128,127 +94,82 @@ class SimpleDemoController(Node):
         self.lastGripperCommand = 0.0
 
         self.armActionClient = ActionClient(
-            self,
-            FollowJointTrajectory,
-            '/arm_controller/follow_joint_trajectory'
-        )
+            self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
 
         self.gripperActionClient = ActionClient(
-            self,
-            GripperCommand,
-            '/gripper_controller/gripper_cmd'
-        )
+            self, GripperCommand, '/gripper_controller/gripper_cmd')
 
-        # ----------------------------------------------------
-        # publisher for mobile base movement
-        #
-        # UPDATED: Removed leading slash to make topic relative
-        # ----------------------------------------------------
         self.cmdVelPub = self.create_publisher(Twist, 'cmd_vel', 10)
 
         self.jointStateSub = self.create_subscription(
-            JointState,
-            '/joint_states',
-            self.jointStateCallback,
-            10
-        )
+            JointState, '/joint_states', self.jointStateCallback, 10)
 
         self.settings = termios.tcgetattr(sys.stdin)
-
         self.timer = self.create_timer(0.1, self.runLoop)
 
+        self.status_printed = False
+
         self.printInstructions()
-        self.printStatus()
 
     def jointStateCallback(self, msg):
         if 'joint1' in msg.name:
-            idx = msg.name.index('joint1')
-            self.currentJ1 = msg.position[idx]
-
+            self.currentJ1 = msg.position[msg.name.index('joint1')]
         if 'joint2' in msg.name:
-            idx = msg.name.index('joint2')
-            self.currentJ2 = msg.position[idx]
-
+            self.currentJ2 = msg.position[msg.name.index('joint2')]
         if 'joint3' in msg.name:
-            idx = msg.name.index('joint3')
-            self.currentJ3 = msg.position[idx]
-
+            self.currentJ3 = msg.position[msg.name.index('joint3')]
         if 'joint4' in msg.name:
-            idx = msg.name.index('joint4')
-            self.currentJ4 = msg.position[idx]
+            self.currentJ4 = msg.position[msg.name.index('joint4')]
 
-        possibleGripperNames = [
-            'gripper',
-            'gripper_left_joint',
-            'gripper_right_joint',
-            'gripper_sub_joint',
-            'joint5'
-        ]
-
+        possibleGripperNames = ['gripper', 'gripper_left_joint', 'gripper_right_joint', 'gripper_sub_joint', 'joint5']
         for name in possibleGripperNames:
             if name in msg.name:
-                idx = msg.name.index(name)
-                self.currentGripper = msg.position[idx]
+                self.currentGripper = msg.position[msg.name.index(name)]
                 break
 
     def runLoop(self):
-        # ----------------------------------------------------
-        # UPDATED: Forced key input to lowercase immediately
-        # ----------------------------------------------------
         key = getKey(self.settings).lower()
 
         # ----------------------------------------------------
-        # mobile base controls
+        # Magnitude Control (Speed Settings)
         # ----------------------------------------------------
-        if key == 'w':
-            self.targetLinearVel = clamp(
-                self.targetLinearVel + linVelStepSize,
-                minLinearVel,
-                maxLinearVel
-            )
+        if key == 'v':
+            self.control_lin_vel = clamp(self.control_lin_vel + 0.01, minLinearVel, maxLinearVel)
+        elif key == 'b':
+            self.control_lin_vel = clamp(self.control_lin_vel - 0.01, minLinearVel, maxLinearVel)
+        elif key == 'n':
+            self.control_ang_vel = clamp(self.control_ang_vel + 0.10, minAngularVel, maxAngularVel)
+        elif key == 'm':
+            self.control_ang_vel = clamp(self.control_ang_vel - 0.10, minAngularVel, maxAngularVel)
 
+        # ----------------------------------------------------
+        # Directional Control (Apply Speeds)
+        # ----------------------------------------------------
+        elif key == 'w':
+            self.targetLinearVel = self.control_lin_vel
         elif key == 'x':
-            self.targetLinearVel = clamp(
-                self.targetLinearVel - linVelStepSize,
-                minLinearVel,
-                maxLinearVel
-            )
-
-        elif key == 'a':
-            self.targetAngularVel = clamp(
-                self.targetAngularVel + angVelStepSize,
-                minAngularVel,
-                maxAngularVel
-            )
-
-        elif key == 'd':
-            self.targetAngularVel = clamp(
-                self.targetAngularVel - angVelStepSize,
-                minAngularVel,
-                maxAngularVel
-            )
-
+            self.targetLinearVel = -self.control_lin_vel
+        elif key == 'q':
+            self.targetAngularVel = self.control_ang_vel
+        elif key == 'e':
+            self.targetAngularVel = -self.control_ang_vel
         elif key == 's':
             self.targetLinearVel = 0.0
             self.targetAngularVel = 0.0
 
         # ----------------------------------------------------
-        # gripper controls
+        # Gripper & Arm Controls
         # ----------------------------------------------------
         elif key in gripperKeyBindings:
             self.lastGripperCommand = gripperKeyBindings[key]
             self.sendGripperGoal(self.lastGripperCommand)
-
-        # ----------------------------------------------------
-        # arm preset controls
-        # ----------------------------------------------------
         elif key in poses:
             self.sendArmGoal(poses[key], 2.0)
 
         # ----------------------------------------------------
-        # quit
+        # Quit (Ctrl+C mapped to raw input \x03)
         # ----------------------------------------------------
-        elif key == 'q':
+        elif key == '\x03':
             self.stopRobot()
             self.destroy_node()
             rclpy.shutdown()
@@ -256,10 +177,7 @@ class SimpleDemoController(Node):
             sys.stdout.write('\nExiting...\n')
             sys.exit(0)
 
-        # publish current base command every loop
         self.publishBaseCommand()
-
-        # refresh terminal display
         self.printStatus()
 
     def publishBaseCommand(self):
@@ -276,7 +194,6 @@ class SimpleDemoController(Node):
 
     def sendArmGoal(self, positions, durationSec):
         if not self.armActionClient.server_is_ready():
-            self.get_logger().info('Arm action server not available')
             return
 
         goal = FollowJointTrajectory.Goal()
@@ -284,54 +201,49 @@ class SimpleDemoController(Node):
 
         point = JointTrajectoryPoint()
         point.positions = positions
-        point.time_from_start = Duration(
-            sec=int(durationSec),
-            nanosec=int((durationSec % 1) * 1e9)
-        )
+        point.time_from_start = Duration(sec=int(durationSec), nanosec=int((durationSec % 1) * 1e9))
 
         goal.trajectory.points.append(point)
         self.armActionClient.send_goal_async(goal)
 
     def sendGripperGoal(self, position):
         if not self.gripperActionClient.server_is_ready():
-            self.get_logger().info('Gripper action server not available')
             return
 
         goal = GripperCommand.Goal()
         goal.command.position = position
         goal.command.max_effort = 1.0
-
         self.gripperActionClient.send_goal_async(goal)
 
     def printStatus(self):
-        sys.stdout.write('\r' + ' ' * 170 + '\r')
+        if self.status_printed:
+            # Move cursor up exactly 5 lines
+            sys.stdout.write('\033[5A')
 
-        statusString = (
-            f"Present Linear Velocity: {self.targetLinearVel:.3f}, "
-            f"Angular Velocity: {self.targetAngularVel:.3f}\n"
-            f"Present Arm Joint Angle "
-            f"J1: {self.currentJ1:.3f} "
-            f"J2: {self.currentJ2:.3f} "
-            f"J3: {self.currentJ3:.3f} "
-            f"J4: {self.currentJ4:.3f}\n"
-            f"Present Gripper Status: cmd={self.lastGripperCommand:.3f} "
-            f"state={self.currentGripper:.3f}\n"
-            f"---------------------------\n"
-        )
-
-        sys.stdout.write(statusString + "\033[4A")
+        # \033[K clears the line from the cursor rightwards, eliminating wrapping issues
+        sys.stdout.write('\033[K' + f"Settings | Lin Step: {self.control_lin_vel:.2f} | Ang Step: {self.control_ang_vel:.2f}\n")
+        sys.stdout.write('\033[K' + f"Velocity | Linear: {self.targetLinearVel:.2f} | Angular: {self.targetAngularVel:.2f}\n")
+        sys.stdout.write('\033[K' + f"Arm      | J1:{self.currentJ1:.2f} J2:{self.currentJ2:.2f} J3:{self.currentJ3:.2f} J4:{self.currentJ4:.2f}\n")
+        sys.stdout.write('\033[K' + f"Gripper  | Cmd: {self.lastGripperCommand:.2f} | State: {self.currentGripper:.2f}\n")
+        sys.stdout.write('\033[K' + f"----------------------------------------------------\n")
         sys.stdout.flush()
+        
+        self.status_printed = True
 
     def printInstructions(self):
         print("""
----------------------------
- Teleoperation Control of TurtleBot3 + OpenManipulatorX
- ---------------------------
- Base
- w : increase linear velocity
- x : decrease linear velocity
- a : increase angular velocity
- d : decrease angular velocity
+----------------------------------------------------
+ Teleoperation Control of TurtleBot3 + OpenManipulator
+----------------------------------------------------
+ Speed Settings:
+ v / b : increase / decrease linear velocity
+ n / m : increase / decrease angular velocity
+
+ Base Movement:
+ w : move forward
+ x : move backward
+ q : turn left
+ e : turn right
  s : base stop
 
  Gripper
@@ -343,9 +255,8 @@ class SimpleDemoController(Node):
  9 : Home pose
  8 : Wave pose
 
- q to quit
- ---------------------------
-""")
+ Ctrl+C to quit
+----------------------------------------------------""")
 
 
 def main(args=None):
