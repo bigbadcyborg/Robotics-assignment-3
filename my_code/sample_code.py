@@ -13,6 +13,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
+# --- NEW: QoS Imports to match the hardware requirements ---
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
@@ -22,7 +25,6 @@ from sensor_msgs.msg import JointState
 
 # ============================================================
 # safety limits for the mobile base
-# RESTORED: Negative limits so the robot can actually go in reverse!
 # ============================================================
 maxLinearVel = 0.20
 minLinearVel = -0.20
@@ -100,7 +102,15 @@ class SimpleDemoController(Node):
         self.gripperActionClient = ActionClient(
             self, GripperCommand, '/gripper_controller/gripper_cmd')
 
-        self.cmdVelPub = self.create_publisher(Twist, 'cmd_vel', 10)
+        # ----------------------------------------------------
+        # UPDATED: Strict QoS Profile matching standard TurtleBot3
+        # ----------------------------------------------------
+        qos_profile = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=10
+        )
+        self.cmdVelPub = self.create_publisher(Twist, '/cmd_vel', qos_profile)
 
         self.jointStateSub = self.create_subscription(
             JointState, '/joint_states', self.jointStateCallback, 10)
@@ -137,11 +147,11 @@ class SimpleDemoController(Node):
         if key == 'v':
             self.control_lin_vel = min(self.control_lin_vel + 0.01, maxLinearVel)
         elif key == 'b':
-            self.control_lin_vel = max(self.control_lin_vel - 0.01, 0.01) # keep above 0
+            self.control_lin_vel = max(self.control_lin_vel - 0.01, 0.01)
         elif key == 'n':
             self.control_ang_vel = min(self.control_ang_vel + 0.10, maxAngularVel)
         elif key == 'm':
-            self.control_ang_vel = max(self.control_ang_vel - 0.10, 0.10) # keep above 0
+            self.control_ang_vel = max(self.control_ang_vel - 0.10, 0.10)
 
         # ----------------------------------------------------
         # Directional Control (Increment the current speed)
@@ -168,7 +178,7 @@ class SimpleDemoController(Node):
             self.sendArmGoal(poses[key], 2.0)
 
         # ----------------------------------------------------
-        # Quit (Cleanly raises an error to trigger final shutdown)
+        # Quit
         # ----------------------------------------------------
         elif key == '\x03':
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
@@ -180,8 +190,9 @@ class SimpleDemoController(Node):
 
     def publishBaseCommand(self):
         twist = Twist()
-        twist.linear.x = self.targetLinearVel
-        twist.angular.z = self.targetAngularVel
+        # Forced float conversion to ensure strict message conformity
+        twist.linear.x = float(self.targetLinearVel)
+        twist.angular.z = float(self.targetAngularVel)
         self.cmdVelPub.publish(twist)
 
     def stopRobot(self):
@@ -215,12 +226,10 @@ class SimpleDemoController(Node):
 
     def printStatus(self):
         if self.status_printed:
-            # \033[5A moves up 5 lines, \r returns to the start of that line
             sys.stdout.write('\033[5A\r')
         else:
             sys.stdout.write('\r')
 
-        # \033[K clears the line cleanly before printing the new values
         sys.stdout.write('\033[K' + f"Settings | Lin Step: {self.control_lin_vel:.2f} | Ang Step: {self.control_ang_vel:.2f}\n")
         sys.stdout.write('\033[K' + f"Velocity | Linear: {self.targetLinearVel:.2f} | Angular: {self.targetAngularVel:.2f}\n")
         sys.stdout.write('\033[K' + f"Arm      | J1:{self.currentJ1:.2f} J2:{self.currentJ2:.2f} J3:{self.currentJ3:.2f} J4:{self.currentJ4:.2f}\n")
@@ -266,7 +275,7 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        pass  # Handled cleanly
+        pass  
     finally:
         if rclpy.ok():
             node.stopRobot()
