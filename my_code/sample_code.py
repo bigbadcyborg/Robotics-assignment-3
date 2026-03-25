@@ -22,11 +22,12 @@ from sensor_msgs.msg import JointState
 
 # ============================================================
 # safety limits for the mobile base
+# RESTORED: Negative limits so the robot can actually go in reverse!
 # ============================================================
 maxLinearVel = 0.20
-minLinearVel = 0.0
+minLinearVel = -0.20
 maxAngularVel = 1.50
-minAngularVel = 0.0
+minAngularVel = -1.50
 
 
 # ============================================================
@@ -131,28 +132,28 @@ class SimpleDemoController(Node):
         key = getKey(self.settings).lower()
 
         # ----------------------------------------------------
-        # Magnitude Control (Speed Settings)
+        # Magnitude Control (Modify the Step Settings)
         # ----------------------------------------------------
         if key == 'v':
-            self.control_lin_vel = clamp(self.control_lin_vel + 0.01, minLinearVel, maxLinearVel)
+            self.control_lin_vel = min(self.control_lin_vel + 0.01, maxLinearVel)
         elif key == 'b':
-            self.control_lin_vel = clamp(self.control_lin_vel - 0.01, minLinearVel, maxLinearVel)
+            self.control_lin_vel = max(self.control_lin_vel - 0.01, 0.01) # keep above 0
         elif key == 'n':
-            self.control_ang_vel = clamp(self.control_ang_vel + 0.10, minAngularVel, maxAngularVel)
+            self.control_ang_vel = min(self.control_ang_vel + 0.10, maxAngularVel)
         elif key == 'm':
-            self.control_ang_vel = clamp(self.control_ang_vel - 0.10, minAngularVel, maxAngularVel)
+            self.control_ang_vel = max(self.control_ang_vel - 0.10, 0.10) # keep above 0
 
         # ----------------------------------------------------
-        # Directional Control (Apply Speeds)
+        # Directional Control (Increment the current speed)
         # ----------------------------------------------------
         elif key == 'w':
-            self.targetLinearVel = self.control_lin_vel
+            self.targetLinearVel = clamp(self.targetLinearVel + self.control_lin_vel, minLinearVel, maxLinearVel)
         elif key == 'x':
-            self.targetLinearVel = -self.control_lin_vel
+            self.targetLinearVel = clamp(self.targetLinearVel - self.control_lin_vel, minLinearVel, maxLinearVel)
         elif key == 'q':
-            self.targetAngularVel = self.control_ang_vel
+            self.targetAngularVel = clamp(self.targetAngularVel + self.control_ang_vel, minAngularVel, maxAngularVel)
         elif key == 'e':
-            self.targetAngularVel = -self.control_ang_vel
+            self.targetAngularVel = clamp(self.targetAngularVel - self.control_ang_vel, minAngularVel, maxAngularVel)
         elif key == 's':
             self.targetLinearVel = 0.0
             self.targetAngularVel = 0.0
@@ -167,15 +168,12 @@ class SimpleDemoController(Node):
             self.sendArmGoal(poses[key], 2.0)
 
         # ----------------------------------------------------
-        # Quit (Ctrl+C mapped to raw input \x03)
+        # Quit (Cleanly raises an error to trigger final shutdown)
         # ----------------------------------------------------
         elif key == '\x03':
-            self.stopRobot()
-            self.destroy_node()
-            rclpy.shutdown()
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
             sys.stdout.write('\nExiting...\n')
-            sys.exit(0)
+            raise KeyboardInterrupt
 
         self.publishBaseCommand()
         self.printStatus()
@@ -217,10 +215,12 @@ class SimpleDemoController(Node):
 
     def printStatus(self):
         if self.status_printed:
-            # Move cursor up exactly 5 lines
-            sys.stdout.write('\033[5A')
+            # \033[5A moves up 5 lines, \r returns to the start of that line
+            sys.stdout.write('\033[5A\r')
+        else:
+            sys.stdout.write('\r')
 
-        # \033[K clears the line from the cursor rightwards, eliminating wrapping issues
+        # \033[K clears the line cleanly before printing the new values
         sys.stdout.write('\033[K' + f"Settings | Lin Step: {self.control_lin_vel:.2f} | Ang Step: {self.control_ang_vel:.2f}\n")
         sys.stdout.write('\033[K' + f"Velocity | Linear: {self.targetLinearVel:.2f} | Angular: {self.targetAngularVel:.2f}\n")
         sys.stdout.write('\033[K' + f"Arm      | J1:{self.currentJ1:.2f} J2:{self.currentJ2:.2f} J3:{self.currentJ3:.2f} J4:{self.currentJ4:.2f}\n")
@@ -265,11 +265,12 @@ def main(args=None):
 
     try:
         rclpy.spin(node)
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    except KeyboardInterrupt:
+        pass  # Handled cleanly
     finally:
-        node.stopRobot()
         if rclpy.ok():
+            node.stopRobot()
+            node.destroy_node()
             rclpy.shutdown()
 
 
