@@ -49,22 +49,14 @@ from sensor_msgs.msg import JointState
 # ============================================================
 # base velocity tuning values
 #
-# these step sizes decide how much velocity changes each time
-# the user presses a movement key.
-#
-# smaller values = smoother, slower changes
-# larger values = faster, more aggressive changes
+# UPDATED: increased to overcome motor deadband/static friction
 # ============================================================
-linVelStepSize = 0.01
-angVelStepSize = 0.10
+linVelStepSize = 0.05
+angVelStepSize = 0.20
 
 
 # ============================================================
 # safety limits for the mobile base
-#
-# these prevent the program from increasing velocities forever.
-# keeping values clamped makes the robot easier to control and
-# safer during the demo.
 # ============================================================
 maxLinearVel = 0.20
 minLinearVel = -0.20
@@ -74,12 +66,6 @@ minAngularVel = -1.50
 
 # ============================================================
 # gripper command mapping
-#
-# these are simple preset gripper target positions.
-# depending on your robot setup, you may adjust these slightly.
-#
-# g = open
-# h = close
 # ============================================================
 gripperKeyBindings = {
     'g': 0.01,
@@ -89,18 +75,6 @@ gripperKeyBindings = {
 
 # ============================================================
 # preset arm poses
-#
-# each pose is a list of target joint angles:
-# [joint1, joint2, joint3, joint4]
-#
-# required by assignment:
-# - home pose
-# - extend forward pose
-# - one extra custom pose
-#
-# important:
-# these values may need minor tuning on your physical robot.
-# if needed, use moveit / rviz to find better joint angles.
 # ============================================================
 poses = {
     '9': [0.0, 0.0, 0.0, 0.0],         # home pose
@@ -112,17 +86,6 @@ poses = {
 def getKey(settings):
     """
     read one key from the keyboard without waiting for enter.
-
-    why this is needed:
-    normal terminal input waits for the enter key.
-    for teleoperation, we want immediate single-key responses.
-
-    steps:
-    1. put terminal into raw mode
-    2. check whether a key is available
-    3. read one character if present
-    4. restore terminal settings
-    5. return the key or empty string
     """
     tty.setraw(sys.stdin.fileno())
     readable, _, _ = select.select([sys.stdin], [], [], 0.05)
@@ -139,10 +102,6 @@ def getKey(settings):
 def clamp(value, low, high):
     """
     limit a numeric value to stay inside [low, high].
-
-    example:
-    if value = 2.0 and high = 1.5, return 1.5
-    if value = -3.0 and low = -1.5, return -1.5
     """
     return max(low, min(value, high))
 
@@ -150,81 +109,30 @@ def clamp(value, low, high):
 class SimpleDemoController(Node):
     """
     main ros2 node for the assignment.
-
-    this single node handles:
-    - keyboard input
-    - base motion publishing
-    - arm action goals
-    - gripper action goals
-    - joint state subscription
-    - terminal status display
     """
 
     def __init__(self):
-        """
-        constructor for the ros2 node.
-
-        here we create:
-        - action clients for arm and gripper
-        - publisher for base velocity commands
-        - subscriber for joint states
-        - timer for repeated control loop execution
-        """
         super().__init__('simple_demo_controller')
 
-        # ----------------------------------------------------
-        # list of arm joint names expected by the trajectory
-        # controller. these must match the robot configuration.
-        # ----------------------------------------------------
         self.armJointNames = ['joint1', 'joint2', 'joint3', 'joint4']
 
-        # ----------------------------------------------------
-        # target base velocities.
-        #
-        # these are the current commanded values that will be
-        # published repeatedly on /cmd_vel.
-        # ----------------------------------------------------
         self.targetLinearVel = 0.0
         self.targetAngularVel = 0.0
 
-        # ----------------------------------------------------
-        # most recent joint angle readings from /joint_states.
-        #
-        # these are updated live by the subscriber callback and
-        # shown on the terminal.
-        # ----------------------------------------------------
         self.currentJ1 = 0.0
         self.currentJ2 = 0.0
         self.currentJ3 = 0.0
         self.currentJ4 = 0.0
 
-        # ----------------------------------------------------
-        # gripper status values
-        #
-        # currentGripper:
-        #     measured from joint_states if available
-        #
-        # lastGripperCommand:
-        #     most recent commanded open / close value
-        # ----------------------------------------------------
         self.currentGripper = 0.0
         self.lastGripperCommand = 0.0
 
-        # ----------------------------------------------------
-        # action client for sending preset arm joint goals
-        #
-        # follow_joint_trajectory is the standard ros2 action
-        # interface for commanding arm trajectories.
-        # ----------------------------------------------------
         self.armActionClient = ActionClient(
             self,
             FollowJointTrajectory,
             '/arm_controller/follow_joint_trajectory'
         )
 
-        # ----------------------------------------------------
-        # action client for sending gripper open / close goals
-        # ----------------------------------------------------
         self.gripperActionClient = ActionClient(
             self,
             GripperCommand,
@@ -234,16 +142,10 @@ class SimpleDemoController(Node):
         # ----------------------------------------------------
         # publisher for mobile base movement
         #
-        # the turtlebot base listens to geometry_msgs/Twist
-        # messages on /cmd_vel.
+        # UPDATED: Removed leading slash to make topic relative
         # ----------------------------------------------------
-        self.cmdVelPub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmdVelPub = self.create_publisher(Twist, 'cmd_vel', 10)
 
-        # ----------------------------------------------------
-        # subscriber for robot joint states
-        #
-        # this lets us monitor the arm joint angles live.
-        # ----------------------------------------------------
         self.jointStateSub = self.create_subscription(
             JointState,
             '/joint_states',
@@ -251,43 +153,14 @@ class SimpleDemoController(Node):
             10
         )
 
-        # ----------------------------------------------------
-        # save current terminal settings so we can restore them
-        # after reading raw keyboard input.
-        # ----------------------------------------------------
         self.settings = termios.tcgetattr(sys.stdin)
 
-        # ----------------------------------------------------
-        # timer that runs every 0.1 seconds
-        #
-        # this acts like the main control loop.
-        # every cycle it:
-        # - reads keyboard input
-        # - updates velocities if needed
-        # - publishes base command continuously
-        # - refreshes status display
-        # ----------------------------------------------------
         self.timer = self.create_timer(0.1, self.runLoop)
 
-        # print menu once at startup
         self.printInstructions()
-
-        # print initial status values
         self.printStatus()
 
     def jointStateCallback(self, msg):
-        """
-        callback for /joint_states messages.
-
-        whenever the robot publishes joint positions, this
-        function updates the values shown on the terminal.
-
-        msg.name contains a list of joint names
-        msg.position contains matching joint angle values
-
-        we search for each arm joint by name, then store its
-        current position in the class variables.
-        """
         if 'joint1' in msg.name:
             idx = msg.name.index('joint1')
             self.currentJ1 = msg.position[idx]
@@ -304,13 +177,6 @@ class SimpleDemoController(Node):
             idx = msg.name.index('joint4')
             self.currentJ4 = msg.position[idx]
 
-        # ----------------------------------------------------
-        # try several possible gripper joint names.
-        #
-        # different robot configs sometimes expose gripper
-        # state under different names. this makes the script
-        # more robust across setups.
-        # ----------------------------------------------------
         possibleGripperNames = [
             'gripper',
             'gripper_left_joint',
@@ -326,27 +192,15 @@ class SimpleDemoController(Node):
                 break
 
     def runLoop(self):
-        """
-        main control loop called by the timer.
-
-        responsibilities:
-        1. read a key if one is pressed
-        2. update velocities or trigger arm / gripper commands
-        3. continuously publish current base command
-        4. update terminal display
-
-        important:
-        we publish the base command every cycle, even if no key
-        is pressed. this helps the robot move more reliably than
-        publishing only on keypress.
-        """
-        key = getKey(self.settings)
+        # ----------------------------------------------------
+        # UPDATED: Forced key input to lowercase immediately
+        # ----------------------------------------------------
+        key = getKey(self.settings).lower()
 
         # ----------------------------------------------------
         # mobile base controls
         # ----------------------------------------------------
         if key == 'w':
-            # increase forward speed
             self.targetLinearVel = clamp(
                 self.targetLinearVel + linVelStepSize,
                 minLinearVel,
@@ -354,8 +208,6 @@ class SimpleDemoController(Node):
             )
 
         elif key == 'x':
-            # decrease linear velocity
-            # if this goes below zero, the robot moves backward
             self.targetLinearVel = clamp(
                 self.targetLinearVel - linVelStepSize,
                 minLinearVel,
@@ -363,8 +215,6 @@ class SimpleDemoController(Node):
             )
 
         elif key == 'a':
-            # increase positive angular velocity
-            # positive angular.z usually means turning left
             self.targetAngularVel = clamp(
                 self.targetAngularVel + angVelStepSize,
                 minAngularVel,
@@ -372,8 +222,6 @@ class SimpleDemoController(Node):
             )
 
         elif key == 'd':
-            # decrease angular velocity
-            # negative angular.z usually means turning right
             self.targetAngularVel = clamp(
                 self.targetAngularVel - angVelStepSize,
                 minAngularVel,
@@ -381,7 +229,6 @@ class SimpleDemoController(Node):
             )
 
         elif key == 's':
-            # immediately stop all base motion
             self.targetLinearVel = 0.0
             self.targetAngularVel = 0.0
 
@@ -401,7 +248,7 @@ class SimpleDemoController(Node):
         # ----------------------------------------------------
         # quit
         # ----------------------------------------------------
-        elif key.lower() == 'q':
+        elif key == 'q':
             self.stopRobot()
             self.destroy_node()
             rclpy.shutdown()
@@ -416,45 +263,18 @@ class SimpleDemoController(Node):
         self.printStatus()
 
     def publishBaseCommand(self):
-        """
-        publish current mobile base command to /cmd_vel.
-
-        twist.linear.x:
-            forward / backward motion
-
-        twist.angular.z:
-            left / right turning motion
-        """
         twist = Twist()
         twist.linear.x = self.targetLinearVel
         twist.angular.z = self.targetAngularVel
         self.cmdVelPub.publish(twist)
 
     def stopRobot(self):
-        """
-        publish a zero velocity command to stop the base.
-        used when quitting or when cleanup is needed.
-        """
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = 0.0
         self.cmdVelPub.publish(twist)
 
     def sendArmGoal(self, positions, durationSec):
-        """
-        send a preset arm trajectory goal.
-
-        positions:
-            list of desired joint angles for joints 1 to 4
-
-        durationSec:
-            how long the motion should take
-
-        follow_joint_trajectory goals contain:
-        - joint names
-        - one or more trajectory points
-        - each point has positions and a time_from_start
-        """
         if not self.armActionClient.server_is_ready():
             self.get_logger().info('Arm action server not available')
             return
@@ -463,32 +283,16 @@ class SimpleDemoController(Node):
         goal.trajectory.joint_names = self.armJointNames
 
         point = JointTrajectoryPoint()
-
-        # set target joint positions for this preset pose
         point.positions = positions
-
-        # specify how long the robot should take to reach them
         point.time_from_start = Duration(
             sec=int(durationSec),
             nanosec=int((durationSec % 1) * 1e9)
         )
 
-        # add this point to the trajectory
         goal.trajectory.points.append(point)
-
-        # send the goal asynchronously
         self.armActionClient.send_goal_async(goal)
 
     def sendGripperGoal(self, position):
-        """
-        send a gripper open / close command.
-
-        position:
-            desired gripper position
-
-        max_effort:
-            how strongly the gripper may apply force
-        """
         if not self.gripperActionClient.server_is_ready():
             self.get_logger().info('Gripper action server not available')
             return
@@ -500,19 +304,6 @@ class SimpleDemoController(Node):
         self.gripperActionClient.send_goal_async(goal)
 
     def printStatus(self):
-        """
-        print the live status block on the terminal.
-
-        values shown:
-        - current linear velocity command
-        - current angular velocity command
-        - current arm joint angles
-        - gripper command and gripper state
-
-        the cursor escape sequence at the end moves the cursor
-        back upward so the same lines are updated in place,
-        instead of printing endlessly downward.
-        """
         sys.stdout.write('\r' + ' ' * 170 + '\r')
 
         statusString = (
@@ -532,10 +323,6 @@ class SimpleDemoController(Node):
         sys.stdout.flush()
 
     def printInstructions(self):
-        """
-        print the on-screen user interface once when the
-        program starts.
-        """
         print("""
 ---------------------------
  Teleoperation Control of TurtleBot3 + OpenManipulatorX
@@ -562,15 +349,6 @@ class SimpleDemoController(Node):
 
 
 def main(args=None):
-    """
-    standard ros2 python entry point.
-
-    steps:
-    1. initialize ros2
-    2. create node
-    3. spin node so callbacks and timer can run
-    4. stop robot and shut down ros2 on exit
-    """
     rclpy.init(args=args)
     node = SimpleDemoController()
 
