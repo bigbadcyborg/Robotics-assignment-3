@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 # ============================================================
-# robotics assignment 3 - Teleop Node (Robotis Architecture)
+# robotics assignment 3 - Teleop Node (Direct Drive)
 # ============================================================
 
 import sys
@@ -19,12 +19,14 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 # ============================================================
-# Configuration & Poses
+# Configuration & Limits
 # ============================================================
 BURGER_MAX_LIN_VEL = 0.22
 BURGER_MAX_ANG_VEL = 2.84
-LIN_VEL_STEP_SIZE = 0.01
-ANG_VEL_STEP_SIZE = 0.1
+
+# Increased to overcome physical floor friction
+LIN_VEL_STEP_SIZE = 0.05
+ANG_VEL_STEP_SIZE = 0.20
 
 poses = {
     '9': [0.0, 0.0, 0.0, 0.0],         # home pose
@@ -41,14 +43,12 @@ msg = """
 ----------------------------------------------------
 Teleoperation Control of TurtleBot3 + OpenManipulator
 ----------------------------------------------------
-Moving around:
-        w
-   a    s    d
-        x
+Base Movement Controls:
+        i / w             (Move Forward)
+ j / a    s    l / d      (Left / Stop / Right)
+        k / x             (Move Backward)
 
-w/x : increase/decrease linear velocity
-a/d : increase/decrease angular velocity
-s   : force stop
+s : force stop all base movement
 
 Arm Preset Poses:
 0 : Extend Forward
@@ -74,23 +74,14 @@ def getKey(settings):
     return key
 
 def vels(target_linear_vel, target_angular_vel):
-    return "currently:\tlinear vel %s\t angular vel %s " % (target_linear_vel, target_angular_vel)
+    return "currently:\tlinear vel %.2f\t angular vel %.2f " % (target_linear_vel, target_angular_vel)
 
-def makeSimpleProfile(output, input, slop):
-    if input > output:
-        output = min(input, output + slop)
-    elif input < output:
-        output = max(input, output - slop)
-    else:
-        output = input
-    return output
-
-def constrain(input, low, high):
-    if input < low:
-        input = low
-    elif input > high:
-        input = high
-    return input
+def constrain(input_vel, low, high):
+    if input_vel < low:
+        input_vel = low
+    elif input_vel > high:
+        input_vel = high
+    return input_vel
 
 def checkLinearLimitVelocity(vel):
     return constrain(vel, -BURGER_MAX_LIN_VEL, BURGER_MAX_LIN_VEL)
@@ -102,10 +93,8 @@ class ManipulationTeleop(Node):
     def __init__(self):
         super().__init__('manipulation_teleop')
         
-        # Publisher for base
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
         
-        # Action clients for arm and gripper
         self.arm_client = ActionClient(self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
         self.gripper_client = ActionClient(self, GripperCommand, '/gripper_controller/gripper_cmd')
         
@@ -136,6 +125,7 @@ class ManipulationTeleop(Node):
         goal_msg.command.max_effort = 1.0
         self.gripper_client.send_goal_async(goal_msg)
 
+
 def main(args=None):
     settings = termios.tcgetattr(sys.stdin)
     rclpy.init(args=args)
@@ -145,71 +135,79 @@ def main(args=None):
     status = 0
     target_linear_vel   = 0.0
     target_angular_vel  = 0.0
-    control_linear_vel  = 0.0
-    control_angular_vel = 0.0
 
     print(msg)
 
     try:
         while rclpy.ok():
-            # Spin once to allow action clients to process responses
             rclpy.spin_once(node, timeout_sec=0.0)
             
-            key = getKey(settings)
+            key = getKey(settings).lower()
 
-            # Base Controls
-            if key == 'w':
+            # ----------------------------------------------------
+            # Base Controls (w/a/s/d and i/j/k/l supported)
+            # ----------------------------------------------------
+            if key in ['w', 'i']:
                 target_linear_vel = checkLinearLimitVelocity(target_linear_vel + LIN_VEL_STEP_SIZE)
                 status = status + 1
                 print(vels(target_linear_vel, target_angular_vel))
-            elif key == 'x':
+            
+            elif key in ['x', 'k']:
                 target_linear_vel = checkLinearLimitVelocity(target_linear_vel - LIN_VEL_STEP_SIZE)
                 status = status + 1
                 print(vels(target_linear_vel, target_angular_vel))
-            elif key == 'a':
+            
+            elif key in ['a', 'j', 'q']:
                 target_angular_vel = checkAngularLimitVelocity(target_angular_vel + ANG_VEL_STEP_SIZE)
                 status = status + 1
                 print(vels(target_linear_vel, target_angular_vel))
-            elif key == 'd':
+            
+            elif key in ['d', 'l', 'e']:
                 target_angular_vel = checkAngularLimitVelocity(target_angular_vel - ANG_VEL_STEP_SIZE)
                 status = status + 1
                 print(vels(target_linear_vel, target_angular_vel))
+            
             elif key == 's':
                 target_linear_vel   = 0.0
-                control_linear_vel  = 0.0
                 target_angular_vel  = 0.0
-                control_angular_vel = 0.0
                 print(vels(target_linear_vel, target_angular_vel))
             
+            # ----------------------------------------------------
             # Arm Controls
+            # ----------------------------------------------------
             elif key in poses:
                 print(f"Executing Arm Pose: {key}")
                 node.send_arm_goal(poses[key])
             
+            # ----------------------------------------------------
             # Gripper Controls
+            # ----------------------------------------------------
             elif key in gripper_bindings:
                 print(f"Executing Gripper Command: {key}")
                 node.send_gripper_goal(gripper_bindings[key])
 
+            # ----------------------------------------------------
             # Quit Command
+            # ----------------------------------------------------
             elif key == '\x03': # CTRL-C
                 break
 
+            # Print menu every 14 inputs to keep the terminal clean
             if status == 14:
                 print(msg)
                 status = 0
 
-            # Smooth velocity acceleration (Matches official ROBOTIS logic)
+            # ----------------------------------------------------
+            # Direct Velocity Assignment (Bypasses Stuttering Math)
+            # ----------------------------------------------------
             twist = Twist()
-            control_linear_vel = makeSimpleProfile(control_linear_vel, target_linear_vel, (LIN_VEL_STEP_SIZE/2.0))
-            twist.linear.x = float(control_linear_vel)
+            twist.linear.x = float(target_linear_vel)
             twist.linear.y = 0.0
             twist.linear.z = 0.0
 
-            control_angular_vel = makeSimpleProfile(control_angular_vel, target_angular_vel, (ANG_VEL_STEP_SIZE/2.0))
             twist.angular.x = 0.0
             twist.angular.y = 0.0
-            twist.angular.z = float(control_angular_vel)
+            twist.angular.z = float(target_angular_vel)
 
             node.cmd_vel_pub.publish(twist)
 
@@ -217,6 +215,7 @@ def main(args=None):
         print(e)
 
     finally:
+        # Safety Stop on exit
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = 0.0
