@@ -1,287 +1,230 @@
 #!/usr/bin/env python3
 
 # ============================================================
-# robotics assignment 3 - Teleop Node
+# robotics assignment 3 - Teleop Node (Robotis Architecture)
 # ============================================================
 
 import sys
-import tty
-import termios
 import select
+import termios
+import tty
 
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
 
-# --- NEW: QoS Imports to match the hardware requirements ---
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
-
+from geometry_msgs.msg import Twist
 from control_msgs.action import FollowJointTrajectory, GripperCommand
 from trajectory_msgs.msg import JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import Twist
-from sensor_msgs.msg import JointState
-
 
 # ============================================================
-# safety limits for the mobile base
+# Configuration & Poses
 # ============================================================
-maxLinearVel = 0.20
-minLinearVel = -0.20
-maxAngularVel = 1.50
-minAngularVel = -1.50
+BURGER_MAX_LIN_VEL = 0.22
+BURGER_MAX_ANG_VEL = 2.84
+LIN_VEL_STEP_SIZE = 0.01
+ANG_VEL_STEP_SIZE = 0.1
 
-
-# ============================================================
-# gripper command mapping
-# ============================================================
-gripperKeyBindings = {
-    'g': 0.01,
-    'h': -0.01
-}
-
-
-# ============================================================
-# preset arm poses
-# ============================================================
 poses = {
     '9': [0.0, 0.0, 0.0, 0.0],         # home pose
     '0': [0.0, -1.10, 0.75, 0.35],     # extend forward
     '8': [0.8, -0.65, 0.30, 0.85]      # wave / custom pose
 }
 
+gripper_bindings = {
+    'g': 0.01,  # Open
+    'h': -0.01  # Close
+}
+
+msg = """
+----------------------------------------------------
+Teleoperation Control of TurtleBot3 + OpenManipulator
+----------------------------------------------------
+Moving around:
+        w
+   a    s    d
+        x
+
+w/x : increase/decrease linear velocity
+a/d : increase/decrease angular velocity
+s   : force stop
+
+Arm Preset Poses:
+0 : Extend Forward
+9 : Home pose
+8 : Wave pose
+
+Gripper:
+g : gripper open
+h : gripper close
+
+CTRL-C to quit
+----------------------------------------------------
+"""
 
 def getKey(settings):
-    """
-    read one key from the keyboard without waiting for enter.
-    """
     tty.setraw(sys.stdin.fileno())
-    readable, _, _ = select.select([sys.stdin], [], [], 0.05)
-
-    if readable:
+    rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+    if rlist:
         key = sys.stdin.read(1)
     else:
         key = ''
-
     termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
     return key
 
+def vels(target_linear_vel, target_angular_vel):
+    return "currently:\tlinear vel %s\t angular vel %s " % (target_linear_vel, target_angular_vel)
 
-def clamp(value, low, high):
-    """
-    limit a numeric value to stay inside [low, high].
-    """
-    return max(low, min(value, high))
+def makeSimpleProfile(output, input, slop):
+    if input > output:
+        output = min(input, output + slop)
+    elif input < output:
+        output = max(input, output - slop)
+    else:
+        output = input
+    return output
 
+def constrain(input, low, high):
+    if input < low:
+        input = low
+    elif input > high:
+        input = high
+    return input
 
-class SimpleDemoController(Node):
+def checkLinearLimitVelocity(vel):
+    return constrain(vel, -BURGER_MAX_LIN_VEL, BURGER_MAX_LIN_VEL)
+
+def checkAngularLimitVelocity(vel):
+    return constrain(vel, -BURGER_MAX_ANG_VEL, BURGER_MAX_ANG_VEL)
+
+class ManipulationTeleop(Node):
     def __init__(self):
-        super().__init__('simple_demo_controller')
+        super().__init__('manipulation_teleop')
+        
+        # Publisher for base
+        self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        
+        # Action clients for arm and gripper
+        self.arm_client = ActionClient(self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
+        self.gripper_client = ActionClient(self, GripperCommand, '/gripper_controller/gripper_cmd')
+        
+        self.arm_joint_names = ['joint1', 'joint2', 'joint3', 'joint4']
 
-        self.armJointNames = ['joint1', 'joint2', 'joint3', 'joint4']
-
-        # Command velocities sent to the robot
-        self.targetLinearVel = 0.0
-        self.targetAngularVel = 0.0
-
-        # Speed settings modified by v, b, n, m
-        self.control_lin_vel = 0.05
-        self.control_ang_vel = 0.20
-
-        self.currentJ1 = 0.0
-        self.currentJ2 = 0.0
-        self.currentJ3 = 0.0
-        self.currentJ4 = 0.0
-
-        self.currentGripper = 0.0
-        self.lastGripperCommand = 0.0
-
-        self.armActionClient = ActionClient(
-            self, FollowJointTrajectory, '/arm_controller/follow_joint_trajectory')
-
-        self.gripperActionClient = ActionClient(
-            self, GripperCommand, '/gripper_controller/gripper_cmd')
-
-        # ----------------------------------------------------
-        # UPDATED: Strict QoS Profile matching standard TurtleBot3
-        # ----------------------------------------------------
-        qos_profile = QoSProfile(
-            reliability=QoSReliabilityPolicy.RELIABLE,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
-        )
-        self.cmdVelPub = self.create_publisher(Twist, '/cmd_vel', qos_profile)
-
-        self.jointStateSub = self.create_subscription(
-            JointState, '/joint_states', self.jointStateCallback, 10)
-
-        self.settings = termios.tcgetattr(sys.stdin)
-        self.timer = self.create_timer(0.1, self.runLoop)
-
-        self.status_printed = False
-
-        self.printInstructions()
-
-    def jointStateCallback(self, msg):
-        if 'joint1' in msg.name:
-            self.currentJ1 = msg.position[msg.name.index('joint1')]
-        if 'joint2' in msg.name:
-            self.currentJ2 = msg.position[msg.name.index('joint2')]
-        if 'joint3' in msg.name:
-            self.currentJ3 = msg.position[msg.name.index('joint3')]
-        if 'joint4' in msg.name:
-            self.currentJ4 = msg.position[msg.name.index('joint4')]
-
-        possibleGripperNames = ['gripper', 'gripper_left_joint', 'gripper_right_joint', 'gripper_sub_joint', 'joint5']
-        for name in possibleGripperNames:
-            if name in msg.name:
-                self.currentGripper = msg.position[msg.name.index(name)]
-                break
-
-    def runLoop(self):
-        key = getKey(self.settings).lower()
-
-        # ----------------------------------------------------
-        # Magnitude Control (Modify the Step Settings)
-        # ----------------------------------------------------
-        if key == 'v':
-            self.control_lin_vel = min(self.control_lin_vel + 0.01, maxLinearVel)
-        elif key == 'b':
-            self.control_lin_vel = max(self.control_lin_vel - 0.01, 0.01)
-        elif key == 'n':
-            self.control_ang_vel = min(self.control_ang_vel + 0.10, maxAngularVel)
-        elif key == 'm':
-            self.control_ang_vel = max(self.control_ang_vel - 0.10, 0.10)
-
-        # ----------------------------------------------------
-        # Directional Control (Increment the current speed)
-        # ----------------------------------------------------
-        elif key == 'w':
-            self.targetLinearVel = clamp(self.targetLinearVel + self.control_lin_vel, minLinearVel, maxLinearVel)
-        elif key == 'x':
-            self.targetLinearVel = clamp(self.targetLinearVel - self.control_lin_vel, minLinearVel, maxLinearVel)
-        elif key == 'q':
-            self.targetAngularVel = clamp(self.targetAngularVel + self.control_ang_vel, minAngularVel, maxAngularVel)
-        elif key == 'e':
-            self.targetAngularVel = clamp(self.targetAngularVel - self.control_ang_vel, minAngularVel, maxAngularVel)
-        elif key == 's':
-            self.targetLinearVel = 0.0
-            self.targetAngularVel = 0.0
-
-        # ----------------------------------------------------
-        # Gripper & Arm Controls
-        # ----------------------------------------------------
-        elif key in gripperKeyBindings:
-            self.lastGripperCommand = gripperKeyBindings[key]
-            self.sendGripperGoal(self.lastGripperCommand)
-        elif key in poses:
-            self.sendArmGoal(poses[key], 2.0)
-
-        # ----------------------------------------------------
-        # Quit
-        # ----------------------------------------------------
-        elif key == '\x03':
-            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
-            sys.stdout.write('\nExiting...\n')
-            raise KeyboardInterrupt
-
-        self.publishBaseCommand()
-        self.printStatus()
-
-    def publishBaseCommand(self):
-        twist = Twist()
-        # Forced float conversion to ensure strict message conformity
-        twist.linear.x = float(self.targetLinearVel)
-        twist.angular.z = float(self.targetAngularVel)
-        self.cmdVelPub.publish(twist)
-
-    def stopRobot(self):
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
-        self.cmdVelPub.publish(twist)
-
-    def sendArmGoal(self, positions, durationSec):
-        if not self.armActionClient.server_is_ready():
+    def send_arm_goal(self, positions, duration_sec=2.0):
+        if not self.arm_client.server_is_ready():
+            self.get_logger().warn('Arm action server not available yet...')
             return
 
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = self.armJointNames
+        goal_msg = FollowJointTrajectory.Goal()
+        goal_msg.trajectory.joint_names = self.arm_joint_names
 
         point = JointTrajectoryPoint()
         point.positions = positions
-        point.time_from_start = Duration(sec=int(durationSec), nanosec=int((durationSec % 1) * 1e9))
+        point.time_from_start = Duration(sec=int(duration_sec), nanosec=int((duration_sec % 1) * 1e9))
 
-        goal.trajectory.points.append(point)
-        self.armActionClient.send_goal_async(goal)
+        goal_msg.trajectory.points.append(point)
+        self.arm_client.send_goal_async(goal_msg)
 
-    def sendGripperGoal(self, position):
-        if not self.gripperActionClient.server_is_ready():
+    def send_gripper_goal(self, position):
+        if not self.gripper_client.server_is_ready():
+            self.get_logger().warn('Gripper action server not available yet...')
             return
 
-        goal = GripperCommand.Goal()
-        goal.command.position = position
-        goal.command.max_effort = 1.0
-        self.gripperActionClient.send_goal_async(goal)
-
-    def printStatus(self):
-        if self.status_printed:
-            sys.stdout.write('\033[5A\r')
-        else:
-            sys.stdout.write('\r')
-
-        sys.stdout.write('\033[K' + f"Settings | Lin Step: {self.control_lin_vel:.2f} | Ang Step: {self.control_ang_vel:.2f}\n")
-        sys.stdout.write('\033[K' + f"Velocity | Linear: {self.targetLinearVel:.2f} | Angular: {self.targetAngularVel:.2f}\n")
-        sys.stdout.write('\033[K' + f"Arm      | J1:{self.currentJ1:.2f} J2:{self.currentJ2:.2f} J3:{self.currentJ3:.2f} J4:{self.currentJ4:.2f}\n")
-        sys.stdout.write('\033[K' + f"Gripper  | Cmd: {self.lastGripperCommand:.2f} | State: {self.currentGripper:.2f}\n")
-        sys.stdout.write('\033[K' + f"----------------------------------------------------\n")
-        sys.stdout.flush()
-        
-        self.status_printed = True
-
-    def printInstructions(self):
-        print("""
-----------------------------------------------------
- Teleoperation Control of TurtleBot3 + OpenManipulator
-----------------------------------------------------
- Speed Settings:
- v / b : increase / decrease linear velocity
- n / m : increase / decrease angular velocity
-
- Base Movement:
- w : move forward
- x : move backward
- q : turn left
- e : turn right
- s : base stop
-
- Gripper
- g : gripper open
- h : gripper close
-
- Arm Preset
- 0 : Extend Forward
- 9 : Home pose
- 8 : Wave pose
-
- Ctrl+C to quit
-----------------------------------------------------""")
-
+        goal_msg = GripperCommand.Goal()
+        goal_msg.command.position = position
+        goal_msg.command.max_effort = 1.0
+        self.gripper_client.send_goal_async(goal_msg)
 
 def main(args=None):
+    settings = termios.tcgetattr(sys.stdin)
     rclpy.init(args=args)
-    node = SimpleDemoController()
+
+    node = ManipulationTeleop()
+
+    status = 0
+    target_linear_vel   = 0.0
+    target_angular_vel  = 0.0
+    control_linear_vel  = 0.0
+    control_angular_vel = 0.0
+
+    print(msg)
 
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass  
-    finally:
-        if rclpy.ok():
-            node.stopRobot()
-            node.destroy_node()
-            rclpy.shutdown()
+        while rclpy.ok():
+            # Spin once to allow action clients to process responses
+            rclpy.spin_once(node, timeout_sec=0.0)
+            
+            key = getKey(settings)
 
+            # Base Controls
+            if key == 'w':
+                target_linear_vel = checkLinearLimitVelocity(target_linear_vel + LIN_VEL_STEP_SIZE)
+                status = status + 1
+                print(vels(target_linear_vel, target_angular_vel))
+            elif key == 'x':
+                target_linear_vel = checkLinearLimitVelocity(target_linear_vel - LIN_VEL_STEP_SIZE)
+                status = status + 1
+                print(vels(target_linear_vel, target_angular_vel))
+            elif key == 'a':
+                target_angular_vel = checkAngularLimitVelocity(target_angular_vel + ANG_VEL_STEP_SIZE)
+                status = status + 1
+                print(vels(target_linear_vel, target_angular_vel))
+            elif key == 'd':
+                target_angular_vel = checkAngularLimitVelocity(target_angular_vel - ANG_VEL_STEP_SIZE)
+                status = status + 1
+                print(vels(target_linear_vel, target_angular_vel))
+            elif key == 's':
+                target_linear_vel   = 0.0
+                control_linear_vel  = 0.0
+                target_angular_vel  = 0.0
+                control_angular_vel = 0.0
+                print(vels(target_linear_vel, target_angular_vel))
+            
+            # Arm Controls
+            elif key in poses:
+                print(f"Executing Arm Pose: {key}")
+                node.send_arm_goal(poses[key])
+            
+            # Gripper Controls
+            elif key in gripper_bindings:
+                print(f"Executing Gripper Command: {key}")
+                node.send_gripper_goal(gripper_bindings[key])
+
+            # Quit Command
+            elif key == '\x03': # CTRL-C
+                break
+
+            if status == 14:
+                print(msg)
+                status = 0
+
+            # Smooth velocity acceleration (Matches official ROBOTIS logic)
+            twist = Twist()
+            control_linear_vel = makeSimpleProfile(control_linear_vel, target_linear_vel, (LIN_VEL_STEP_SIZE/2.0))
+            twist.linear.x = float(control_linear_vel)
+            twist.linear.y = 0.0
+            twist.linear.z = 0.0
+
+            control_angular_vel = makeSimpleProfile(control_angular_vel, target_angular_vel, (ANG_VEL_STEP_SIZE/2.0))
+            twist.angular.x = 0.0
+            twist.angular.y = 0.0
+            twist.angular.z = float(control_angular_vel)
+
+            node.cmd_vel_pub.publish(twist)
+
+    except Exception as e:
+        print(e)
+
+    finally:
+        twist = Twist()
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        node.cmd_vel_pub.publish(twist)
+
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
